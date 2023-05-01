@@ -1,0 +1,14 @@
+[Unit]
+Description=Flow Monitor Service
+After=network.target
+StartLimitIntervalSec=15
+StartLimitBurst=5
+
+[Service]
+WorkingDirectory=/var/lib/flow-monitor
+ExecStart=/home/chris/.pyenv/versions/3.11.3/envs/automation/bin/python flow.py
+Restart=always
+TimeoutSec=20
+
+[Install]
+WantedBy=multi-user.target
