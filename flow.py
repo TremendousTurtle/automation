@@ -107,7 +107,7 @@ class FlowMeter:
         
         self.publish_volume(volume=volume)
         self.writeCsv(start=this_start_time.timestamp(), end=this_last_pulse_time.timestamp(), duration=duration, pulses=this_count, flow=flow, volume=volume)
-        self.print_flush(f'Flow ended at {this_last_pulse_time.ctime()} -> duration: {round(duration, 2)}s pulses: {this_count} Hz: {round(avg_frequency, 2)} Flow: {round(flow, 2)} L/min Volume: {round(volume, 2)} L')
+        self.print_flush(f'Flow ended at {this_last_pulse_time.ctime()} -> duration: {round(duration, 2)}s pulses: {this_count} Hz: {round(avg_frequency, 2)} Flow: {round(flow, 2)} gal/min Volume: {round(volume, 2)} gal')
     
     def start(self):
         # Called to start the monitoring of the flow meter
