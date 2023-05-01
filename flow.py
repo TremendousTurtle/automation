@@ -5,8 +5,9 @@ from datetime import datetime
 from threading import Lock
 from os import path
 from csv import DictWriter
+import sys
 import paho.mqtt.client as mqtt
-from . import config
+import config
 
 
 class FlowMeter:
@@ -29,12 +30,10 @@ class FlowMeter:
         self.F_VALUE = 36.5
         
         # CSV file to write to
-        self.csv_path = '/home/chris/'
+        self.csv_path = '.'
         self.csv_file = ''
-        self.fieldnames = ['startTime', 'endTime', 'duration', 'pulses', 'flow']
+        self.fieldnames = ['startTime', 'endTime', 'duration', 'pulses', 'flow', 'volume']
         
-        
-
         self.sensor = DigitalInputDevice(self.FLOW_SENSOR_GPIO, pull_up=True)
  
         self.is_flowing = False
@@ -51,21 +50,28 @@ class FlowMeter:
         self.activate_count = 0
         self.deactivate_count = 0
         
-        self.mqtt_client = mqtt.Client(clean_session=False)
+        self.mqtt_client = mqtt.Client()
         self.mqtt_client.username_pw_set(username=config.mqtt_client_username, password=config.mqtt_client_password)
+        self.volume_topic = 'flow/water_cooler_volume'
+        self.flow_topic = 'flow/water_cooler_flow'
         
         self.lock = Lock()
         self.write_lock = Lock()
         
     
-    def writeCsv(self, start:float, end:float, duration:float, pulses:int, flow:float):
+    def writeCsv(self, start:float, end:float, duration:float, pulses:int, flow:float, volume:float):
+        # Write data to CSV file
         with self.write_lock:
             with open(self.csv_file, 'w', newline='') as csvfile:
                 writer = DictWriter(csvfile, fieldnames=self.fieldnames)
-                writer.writerow({'startTime': start, 'endTime': end, 'duration': duration, 'pulses': pulses, 'flow': flow})
+                writer.writerow({'startTime': start, 'endTime': end, 'duration': duration, 'pulses': pulses, 'flow': flow, 'volume': volume})
+        
+        self.print_flush(f'Data written to CSV: {self.csv_file}')
         
     def reset(self):
+        # Reset the flow meter internal values for startup or reset
         with self.lock:
+            # Make sure to end any active flow
             if self.is_flowing:
                 self.flow_ended(this_start_time=self.flow_start_time, this_flow_start=self.flow_start, this_last_pulse=self.last_pulse, this_last_pulse_time=self.last_pulse_time, this_count=self.current_count)
             
@@ -78,29 +84,53 @@ class FlowMeter:
             self.last_pulse = 0
             self.last_pulse_time = datetime.now()
             self.sensor.when_activated = None
+        
+        self.print_flush('Flow meter reset')
             
     def flow_ended(self, this_start_time:datetime, this_flow_start:float, this_last_pulse:float, this_last_pulse_time:datetime, this_count:int):
+        # Function called when end of flow is detected
+        # Calculate flow duration in seconds
         duration = this_last_pulse - this_flow_start
+        
+        # Calculate average frequency in Hz over flow duration
         avg_frequency = this_count / duration
-        flow = avg_frequency / self.F_VALUE
-        print(f'Flow ended at {this_last_pulse_time.ctime()} -> duration: {round(duration, 2)}s pulses: {this_count} Hz: {round(avg_frequency, 2)} Flow: {round(flow, 2)} L/min Volume: {round(flow * (duration/60), 2)} L')
-        self.writeCsv(start=this_start_time.timestamp(), end=this_last_pulse_time.timestamp(), duration=duration, pulses=this_count, flow=flow)
+        flow = self.calculate_flow(duration=duration, count=this_count)
+        
+        # Calculate volume from flow rate and duration
+        volume = flow * (duration/60)
+        
+        self.publish_volume(volume=volume)
+        self.writeCsv(start=this_start_time.timestamp(), end=this_last_pulse_time.timestamp(), duration=duration, pulses=this_count, flow=flow, volume=volume)
+        self.print_flush(f'Flow ended at {this_last_pulse_time.ctime()} -> duration: {round(duration, 2)}s pulses: {this_count} Hz: {round(avg_frequency, 2)} Flow: {round(flow, 2)} L/min Volume: {round(volume, 2)} L')
     
     def start(self):
+        # Called to start the monitoring of the flow meter
+        # Generate the CSV file using current timestamp
         self.csv_file = path.join(self.csv_path, f'flow_data_{datetime.now().timestamp()}.csv')
-        
         with open(self.csv_file, 'w', newline='') as csvfile:
             writer = DictWriter(csvfile, fieldnames=self.fieldnames)
             writer.writeheader()
-                
+        self.print_flush(f'CSV file created: {self.csv_file}')
+        
+        # Ensure values are properly set for startup
         self.reset()
-        self.mqtt_client.connect(self.MQTT_SERVER)
+        
+        # Connect to MQTT Broker and start background MQTT loop
+        self.mqtt_client.connect(host=self.MQTT_SERVER)
         self.mqtt_client.loop_start()
+        self.print_flush(f'Connected to MQTT server: {self.MQTT_SERVER}')
+        
+        # Activate the sensor callback function
         self.sensor.when_activated = self.sensor_activated
+        
+        # Set initial idle publish time
         with self.lock:
             self.idle_publish = perf_counter()
+        self.print_flush('Flow meter started')
     
     def sensor_activated(self):
+        # Function called when a pulse is detected by the flow meter
+        # Grab time data and increment pulse count
         with self.lock:
             now = perf_counter()
             now_time = datetime.now()
@@ -108,18 +138,26 @@ class FlowMeter:
             self.last_pulse_time = now_time
             self.current_count += 1
             
+            # If a flow was not already active then activate the flow and set start time and last publish time
             if not self.is_flowing:
                 self.flow_start = now
                 self.flow_start_time = now_time
                 self.last_publish = now
                 self.is_flowing = True
-                print(f'Flow started at {self.flow_start_time.ctime()} -> pulses: {self.current_count}')
+                self.print_flush(f'Flow started at {self.flow_start_time.ctime()} -> pulses: {self.current_count}')
                 
-            
     
     def check_flow(self):
+        # Function called in loop to perform neccessary actions at correct times
+        
+        # Get current "time"
         now = perf_counter()
+        
+        # If flow is active (is_flowing == True and count is at least 1) then get current values
+        # Publish flow rate every 1 second during active flow
+        # If flow is inactive for MIN_TIME_INACTIVE then end the flow and publish the volume
         if self.current_count > 0 and self.is_flowing:
+            # Grab and set data with lock
             with self.lock:
                 this_last_pulse = self.last_pulse
                 this_last_pulse_time = self.last_pulse_time
@@ -130,11 +168,15 @@ class FlowMeter:
                 publish_duration = now - this_last_publish
                 idle_duration = now - this_last_pulse
                 
+                # If it is time to publish then set publish time and count appropriately
                 if publish_duration >= 1:
                     self.last_publish = now
+                    # Calculate the number of pulses since last publish
                     this_publish_count = this_count - self.publish_count
+                    # Save the current count for start of next publish period
                     self.publish_count = this_count
                     
+                # If flow is inactive then reset values to wait for next flow
                 if idle_duration >= self.MIN_TIME_INACTIVE:
                     self.is_flowing = False
                     self.current_count = 0
@@ -143,40 +185,60 @@ class FlowMeter:
                     self.last_publish = 0
                     self.publish_count = 0
             
+            # Check and publish grabbed data without lock
             if publish_duration >= 1:
                 # publish current flow rate to MQTT
                 self.publish_flow(duration=publish_duration, count=this_publish_count)
                 
+            # If flow is inactive then end the flow
             if idle_duration >= self.MIN_TIME_INACTIVE:
                 self.flow_ended(this_start_time=this_start_time, this_flow_start=this_flow_start, this_last_pulse=this_last_pulse, this_last_pulse_time=this_last_pulse_time, this_count=this_count)
-                
+        
+        # If flow is inactive then publish 0 flow rate every 1 second        
         elif now - self.idle_publish >= 1:
             with self.lock:
                 self.idle_publish = now
             
-            self.publish_no_flow()
+            self.publish_flow()
             
         
     def calculate_flow(self, duration, count) -> float:
-        return round(((count / duration) / self.F_VALUE), 2)
+        # Calculate flow rate in L/min then convert to gal/min (divide by 3.78541)
+        return ((count / duration) / self.F_VALUE) / 3.78541
     
-    def publish_flow(self, duration, count):
-        self.mqtt_client.publish('flow/water_cooler', self.calculate_flow(duration, count))
+    def publish_flow(self, duration=0, count=0):
+        # If count is 0 (or not provided) then skip calculation and publish 0
+        if count == 0:
+            flow = 0
+        else:
+            flow = self.calculate_flow(duration, count)
+        self.mqtt_client.publish(topic=self.flow_topic, payload=flow, qos=2)
+        self.print_flush(f'Flow published to "{self.flow_topic}": {flow}')
         
-    def publish_no_flow(self):
-        self.mqtt_client.publish('flow/water_cooler', "0")
+    def publish_volume(self, volume):
+        self.mqtt_client.publish(topic=self.volume_topic, payload=volume, qos=2)
+        self.print_flush(f'Volume published to "{self.volume_topic}": {volume}')
     
     def print_activate(self):
+        # Debugging function to print when the sensor is activated
         with self.lock:
             self.activate_count += 1
             print(f'Activated: {self.activate_count}')
+            sys.stdout.flush()
         
     def print_deactivate(self):
+        # Debugging function to print when the sensor is deactivated
         with self.lock:
             self.deactivate_count += 1
-            print(f'Deactivated: {self.deactivate_count}')
+            self.print_flush(f'Deactivated: {self.deactivate_count}')
+            
+    def print_flush(self, message):
+        # Simple wraapper to print then flush stdout for systemd journal
+        print(message)
+        sys.stdout.flush()
     
     def test(self):
+        # Debugging function to test sensor activation/deactivation
         self.sensor.when_activated = self.print_activate
         self.sensor.when_deactivated = self.print_deactivate
 
@@ -185,6 +247,7 @@ if __name__ == '__main__':
     flow_meter.start()
     #flow_meter.test()
     
+    # Loop forever checking flow and publishing when needed
     while True:
         flow_meter.check_flow()
     
