@@ -20,7 +20,7 @@ class FlowMeter:
         self.MIN_TIME_INACTIVE = min_inactive_time
         
         # Sample duration in seconds
-        self.sample_duration = sample_duration
+        self.SAMPLE_DURATION = sample_duration
 
         # MQTT Server IP
         self.MQTT_SERVER = mqtt_server
@@ -28,6 +28,14 @@ class FlowMeter:
         # Flow meter calibration factor
         # Sensor given value = 23
         self.F_VALUE = 36.5
+        
+        # Seconds to wait between publishing flow data during an active/inactive flow
+        self.ACTIVE_FLOW_PUBLISH_PERIOD = 1
+        self.INACTIVE_FLOW_PUBLISH_PERIOD = 5
+        
+        # MQTT Topics
+        self.VOLUME_TOPIC = 'flow/water_cooler_volume'
+        self.FLOW_TOPIC = 'flow/water_cooler_flow'
         
         # CSV file to write to
         self.csv_path = '.'
@@ -52,8 +60,6 @@ class FlowMeter:
         
         self.mqtt_client = mqtt.Client()
         self.mqtt_client.username_pw_set(username=config.mqtt_client_username, password=config.mqtt_client_password)
-        self.volume_topic = 'flow/water_cooler_volume'
-        self.flow_topic = 'flow/water_cooler_flow'
         
         self.lock = Lock()
         self.write_lock = Lock()
@@ -154,7 +160,7 @@ class FlowMeter:
         now = perf_counter()
         
         # If flow is active (is_flowing == True and count is at least 1) then get current values
-        # Publish flow rate every 1 second during active flow
+        # Publish flow rate every ACTIVE_FLOW_PUBLISH_PERIOD second(s) during active flow
         # If flow is inactive for MIN_TIME_INACTIVE then end the flow and publish the volume
         if self.current_count > 0 and self.is_flowing:
             # Grab and set data with lock
@@ -169,7 +175,7 @@ class FlowMeter:
                 idle_duration = now - this_last_pulse
                 
                 # If it is time to publish then set publish time and count appropriately
-                if publish_duration >= 1:
+                if publish_duration >= self.ACTIVE_FLOW_PUBLISH_PERIOD:
                     self.last_publish = now
                     # Calculate the number of pulses since last publish
                     this_publish_count = this_count - self.publish_count
@@ -186,7 +192,7 @@ class FlowMeter:
                     self.publish_count = 0
             
             # Check and publish grabbed data without lock
-            if publish_duration >= 1:
+            if publish_duration >= self.ACTIVE_FLOW_PUBLISH_PERIOD:
                 # publish current flow rate to MQTT
                 self.publish_flow(duration=publish_duration, count=this_publish_count)
                 
@@ -194,8 +200,8 @@ class FlowMeter:
             if idle_duration >= self.MIN_TIME_INACTIVE:
                 self.flow_ended(this_start_time=this_start_time, this_flow_start=this_flow_start, this_last_pulse=this_last_pulse, this_last_pulse_time=this_last_pulse_time, this_count=this_count)
         
-        # If flow is inactive then publish 0 flow rate every 1 second        
-        elif now - self.idle_publish >= 1:
+        # If flow is inactive then publish 0 flow rate every INACTIVE_FLOW_PUBLISH_PERIOD second(s)        
+        elif now - self.idle_publish >= self.INACTIVE_FLOW_PUBLISH_PERIOD:
             with self.lock:
                 self.idle_publish = now
             
@@ -212,12 +218,12 @@ class FlowMeter:
             flow = 0
         else:
             flow = self.calculate_flow(duration, count)
-        self.mqtt_client.publish(topic=self.flow_topic, payload=flow, qos=2)
-        self.print_flush(f'Flow published to "{self.flow_topic}": {flow}')
+        self.mqtt_client.publish(topic=self.FLOW_TOPIC, payload=flow, qos=2)
+        self.print_flush(f'Flow published to "{self.FLOW_TOPIC}": {flow}')
         
     def publish_volume(self, volume):
-        self.mqtt_client.publish(topic=self.volume_topic, payload=volume, qos=2)
-        self.print_flush(f'Volume published to "{self.volume_topic}": {volume}')
+        self.mqtt_client.publish(topic=self.VOLUME_TOPIC, payload=volume, qos=2)
+        self.print_flush(f'Volume published to "{self.VOLUME_TOPIC}": {volume}')
     
     def print_activate(self):
         # Debugging function to print when the sensor is activated
