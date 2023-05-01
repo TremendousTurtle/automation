@@ -5,7 +5,8 @@ from datetime import datetime
 from threading import Lock
 from os import path
 from csv import DictWriter
-#import paho.mqtt.publish as publish
+import paho.mqtt.client as mqtt
+from . import config
 
 
 class FlowMeter:
@@ -41,14 +42,17 @@ class FlowMeter:
         self.flow_start_time = datetime.now()
         self.last_pulse = 0
         self.last_pulse_time = datetime.now()
-        self.idle_publish = 0
         
+        self.idle_publish = 0
         self.last_publish = 0
         
         self.current_count = 0
         self.publish_count = 0
         self.activate_count = 0
         self.deactivate_count = 0
+        
+        self.mqtt_client = mqtt.Client(clean_session=False)
+        self.mqtt_client.username_pw_set(username=config.mqtt_client_username, password=config.mqtt_client_password)
         
         self.lock = Lock()
         self.write_lock = Lock()
@@ -81,7 +85,6 @@ class FlowMeter:
         flow = avg_frequency / self.F_VALUE
         print(f'Flow ended at {this_last_pulse_time.ctime()} -> duration: {round(duration, 2)}s pulses: {this_count} Hz: {round(avg_frequency, 2)} Flow: {round(flow, 2)} L/min Volume: {round(flow * (duration/60), 2)} L')
         self.writeCsv(start=this_start_time.timestamp(), end=this_last_pulse_time.timestamp(), duration=duration, pulses=this_count, flow=flow)
-        #publish.single("/Garden.Pi/WaterFlow", flow, hostname=MQTT_SERVER)
     
     def start(self):
         self.csv_file = path.join(self.csv_path, f'flow_data_{datetime.now().timestamp()}.csv')
@@ -91,6 +94,8 @@ class FlowMeter:
             writer.writeheader()
                 
         self.reset()
+        self.mqtt_client.connect(self.MQTT_SERVER)
+        self.mqtt_client.loop_start()
         self.sensor.when_activated = self.sensor_activated
         with self.lock:
             self.idle_publish = perf_counter()
@@ -153,15 +158,13 @@ class FlowMeter:
             
         
     def calculate_flow(self, duration, count) -> float:
-        return (count / duration) / self.F_VALUE
+        return round(((count / duration) / self.F_VALUE), 2)
     
     def publish_flow(self, duration, count):
-        flow = self.calculate_flow(duration, count)
-        #publish to MQTT
+        self.mqtt_client.publish('flow/water_cooler', self.calculate_flow(duration, count))
         
     def publish_no_flow(self):
-        #publish 0 flow to MQTT
-        pass
+        self.mqtt_client.publish('flow/water_cooler', "0")
     
     def print_activate(self):
         with self.lock:
@@ -182,10 +185,6 @@ if __name__ == '__main__':
     flow_meter.start()
     #flow_meter.test()
     
-    try:
-        while True:
-            flow_meter.check_flow()
-    except KeyboardInterrupt:
-        flow_meter.reset()
-        print('Exiting...')
+    while True:
+        flow_meter.check_flow()
     
