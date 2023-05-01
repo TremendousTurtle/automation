@@ -24,7 +24,8 @@ class FlowMeter:
         self.MQTT_SERVER = mqtt_server
         
         # Flow meter calibration factor
-        self.F_VALUE = 23
+        # Sensor given value = 23
+        self.F_VALUE = 36.5
         
         # CSV file to write to
         self.csv_path = '/home/chris/'
@@ -40,8 +41,12 @@ class FlowMeter:
         self.flow_start_time = datetime.now()
         self.last_pulse = 0
         self.last_pulse_time = datetime.now()
+        self.idle_publish = 0
+        
+        self.last_publish = 0
         
         self.current_count = 0
+        self.publish_count = 0
         self.activate_count = 0
         self.deactivate_count = 0
         
@@ -81,50 +86,82 @@ class FlowMeter:
     def start(self):
         self.csv_file = path.join(self.csv_path, f'flow_data_{datetime.now().timestamp()}.csv')
         
-        # if self.csv_file does not exist then write the csv header
-        if not path.exists(self.csv_file):
-            with open(self.csv_file, 'w', newline='') as csvfile:
-                writer = DictWriter(csvfile, fieldnames=self.fieldnames)
-                writer.writeheader()
+        with open(self.csv_file, 'w', newline='') as csvfile:
+            writer = DictWriter(csvfile, fieldnames=self.fieldnames)
+            writer.writeheader()
                 
         self.reset()
         self.sensor.when_activated = self.sensor_activated
+        with self.lock:
+            self.idle_publish = perf_counter()
     
     def sensor_activated(self):
         with self.lock:
+            now = perf_counter()
+            now_time = datetime.now()
+            self.last_pulse = now
+            self.last_pulse_time = now_time
+            self.current_count += 1
+            
             if not self.is_flowing:
-                self.flow_start = perf_counter()
-                self.flow_start_time = datetime.now()
+                self.flow_start = now
+                self.flow_start_time = now_time
+                self.last_publish = now
                 self.is_flowing = True
                 print(f'Flow started at {self.flow_start_time.ctime()} -> pulses: {self.current_count}')
                 
-            self.last_pulse = perf_counter()
-            self.last_pulse_time = datetime.now()
-            self.current_count += 1
+            
     
-    def flow_ending(self) -> bool:
-        if self.current_count > 0:
+    def check_flow(self):
+        now = perf_counter()
+        if self.current_count > 0 and self.is_flowing:
             with self.lock:
                 this_last_pulse = self.last_pulse
                 this_last_pulse_time = self.last_pulse_time
                 this_flow_start = self.flow_start
                 this_start_time = self.flow_start_time
                 this_count = self.current_count
-                idle_duration = perf_counter() - this_last_pulse
+                this_last_publish = self.last_publish
+                publish_duration = now - this_last_publish
+                idle_duration = now - this_last_pulse
                 
+                if publish_duration >= 1:
+                    self.last_publish = now
+                    this_publish_count = this_count - self.publish_count
+                    self.publish_count = this_count
+                    
                 if idle_duration >= self.MIN_TIME_INACTIVE:
                     self.is_flowing = False
                     self.current_count = 0
                     self.flow_start = 0
                     self.last_pulse = 0
+                    self.last_publish = 0
+                    self.publish_count = 0
             
+            if publish_duration >= 1:
+                # publish current flow rate to MQTT
+                self.publish_flow(duration=publish_duration, count=this_publish_count)
+                
             if idle_duration >= self.MIN_TIME_INACTIVE:
                 self.flow_ended(this_start_time=this_start_time, this_flow_start=this_flow_start, this_last_pulse=this_last_pulse, this_last_pulse_time=this_last_pulse_time, this_count=this_count)
-                return True
-            else:
-                return False
-        else:
-            return False
+                
+        elif now - self.idle_publish >= 1:
+            with self.lock:
+                self.idle_publish = now
+            
+            self.publish_no_flow()
+            
+        
+    def calculate_flow(self, duration, count) -> float:
+        return (count / duration) / self.F_VALUE
+    
+    def publish_flow(self, duration, count):
+        flow = self.calculate_flow(duration, count)
+        #publish to MQTT
+        
+    def publish_no_flow(self):
+        #publish 0 flow to MQTT
+        pass
     
     def print_activate(self):
         with self.lock:
@@ -147,7 +184,7 @@ if __name__ == '__main__':
     
     try:
         while True:
-            flow_meter.flow_ending()
+            flow_meter.check_flow()
     except KeyboardInterrupt:
         flow_meter.reset()
         print('Exiting...')
