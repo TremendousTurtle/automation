@@ -12,15 +12,12 @@ import config
 
 class FlowMeter:
 
-    def __init__(self, pin=24, sample_duration=1, min_inactive_time=2, mqtt_server='192.168.1.234'):
+    def __init__(self, pin=24, min_inactive_time=2, mqtt_server='192.168.1.234'):
         # GPIO Pin the flow meter is attached to
         self.FLOW_SENSOR_GPIO = pin
         
         # minimum time in seconds between pulses before we consider the flow stopped
         self.MIN_TIME_INACTIVE = min_inactive_time
-        
-        # Sample duration in seconds
-        self.SAMPLE_DURATION = sample_duration
 
         # MQTT Server IP
         self.MQTT_SERVER = mqtt_server
