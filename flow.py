@@ -1,6 +1,6 @@
 #!/usr/bin/python
 from gpiozero import DigitalInputDevice
-from time import perf_counter
+from time import perf_counter, sleep
 from datetime import datetime
 from threading import Lock
 from os import path
@@ -241,6 +241,10 @@ class FlowMeter:
             # If flow is inactive then end the flow
             if idle_duration >= self.MIN_TIME_INACTIVE:
                 self.flow_ended(this_start_time=this_start_time, this_flow_start=this_flow_start, this_last_pulse=this_last_pulse, this_last_pulse_time=this_last_pulse_time, this_count=this_count)
+            
+            sleep(0.1)
+        else:
+            sleep(0.5)
         
     def calculate_flow(self, duration, count) -> float:
         # Calculate flow rate in gal/min
