@@ -284,8 +284,8 @@ class FlowMeter:
 
 if __name__ == '__main__':
     flow_meter = FlowMeter()
-    #flow_meter.start()
-    flow_meter.start(calibrate_volume=(1 / 8))
+    flow_meter.start()
+    #flow_meter.start(calibrate_volume=(1 / 8))
     #flow_meter.test()
     
     # Loop forever checking flow and publishing when needed
