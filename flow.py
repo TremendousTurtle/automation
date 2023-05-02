@@ -46,8 +46,6 @@ class FlowMeter:
         self.flow_start_time = datetime.now()
         self.last_pulse = 0
         self.last_pulse_time = datetime.now()
-        
-        self.idle_publish = 0
         self.last_publish = 0
         
         self.current_count = 0
@@ -126,9 +124,6 @@ class FlowMeter:
         # Activate the sensor callback function
         self.sensor.when_activated = self.sensor_activated
         
-        # Set initial idle publish time
-        with self.lock:
-            self.idle_publish = perf_counter()
         self.print_flush('Flow meter started')
     
     def sensor_activated(self):
@@ -196,14 +191,6 @@ class FlowMeter:
             # If flow is inactive then end the flow
             if idle_duration >= self.MIN_TIME_INACTIVE:
                 self.flow_ended(this_start_time=this_start_time, this_flow_start=this_flow_start, this_last_pulse=this_last_pulse, this_last_pulse_time=this_last_pulse_time, this_count=this_count)
-        
-        # If flow is inactive then publish 0 flow rate every INACTIVE_FLOW_PUBLISH_PERIOD second(s)        
-        elif now - self.idle_publish >= self.INACTIVE_FLOW_PUBLISH_PERIOD:
-            with self.lock:
-                self.idle_publish = now
-            
-            self.publish_flow()
-            
         
     def calculate_flow(self, duration, count) -> float:
         # Calculate flow rate in L/min then convert to gal/min (divide by 3.78541)
