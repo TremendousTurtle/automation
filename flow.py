@@ -23,8 +23,12 @@ class FlowMeter:
         self.MQTT_SERVER = mqtt_server
         
         # Flow meter calibration factor
-        # Sensor given value = 23
-        self.F_VALUE = 36.5
+        # Sensor given value = 23 (liters/minute)
+        # rough calibration factor = 36.5 (liters/minute)
+        self.CALIBRATION_FACTOR = 8138.666667 # Calibrated for gal/minute
+        
+        self.CALIBRATE_VOLUME = (1/8) #volume to fill in gal for calibration (1 pint)
+        self.CALIBRATE_ROUNDS = 5 #number of times to fill the container for calibration
         
         # Seconds to wait between publishing flow data during an active/inactive flow
         self.ACTIVE_FLOW_PUBLISH_PERIOD = 1
@@ -38,6 +42,7 @@ class FlowMeter:
         self.csv_path = '.'
         self.csv_file = ''
         self.fieldnames = ['startTime', 'endTime', 'duration', 'pulses', 'flow', 'volume']
+        self.calibrate_fieldnames = ['startTime', 'endTime', 'duration', 'pulses', 'frequency', 'volume', 'calibration_factor']
         
         self.sensor = DigitalInputDevice(self.FLOW_SENSOR_GPIO, pull_up=True)
  
@@ -53,12 +58,25 @@ class FlowMeter:
         self.activate_count = 0
         self.deactivate_count = 0
         
+        self.calibrate = False
+        self.calibrate_counter = 0
+        self.calibration_factor_values = []
+        
         self.mqtt_client = mqtt.Client()
         self.mqtt_client.username_pw_set(username=config.mqtt_client_username, password=config.mqtt_client_password)
         
         self.lock = Lock()
         self.write_lock = Lock()
         
+    
+    def writeCalibrationCsv(self, start:float, end:float, duration:float, pulses:int, frequency:float, volume:float, calibration_factor:float):
+        # Write data to CSV file
+        with self.write_lock:
+            with open(self.csv_file, 'w', newline='') as csvfile:
+                writer = DictWriter(csvfile, fieldnames=self.fieldnames)
+                writer.writerow({'startTime': start, 'endTime': end, 'duration': duration, 'pulses': pulses, 'frequency': frequency, 'volume': volume, 'calibration_factor': calibration_factor})
+        
+        self.print_flush(f'Calibration data written to CSV: {self.csv_file}')
     
     def writeCsv(self, start:float, end:float, duration:float, pulses:int, flow:float, volume:float):
         # Write data to CSV file
@@ -95,19 +113,44 @@ class FlowMeter:
         
         # Calculate average frequency in Hz over flow duration
         avg_frequency = this_count / duration
-        flow = self.calculate_flow(duration=duration, count=this_count)
         
-        # Calculate volume from flow rate and duration
-        volume = flow * (duration/60)
+        if self.calibrate:
+            # Calibration Factor = (Duration * Frequency) / Volume
+            calibration_factor = (duration * avg_frequency) / (self.CALIBRATE_VOLUME)
+            self.calibration_factor_values.append(calibration_factor)
+            flow = (self.CALIBRATE_VOLUME) / (duration/60)
+        else:
+            flow = self.calculate_flow(duration=duration, count=this_count)
         
-        self.publish_volume(volume=volume)
-        self.writeCsv(start=this_start_time.timestamp(), end=this_last_pulse_time.timestamp(), duration=duration, pulses=this_count, flow=flow, volume=volume)
-        self.print_flush(f'Flow ended at {this_last_pulse_time.ctime()} -> duration: {round(duration, 2)}s pulses: {this_count} Hz: {round(avg_frequency, 2)} Flow: {round(flow, 2)} gal/min Volume: {round(volume, 2)} gal')
+            # Calculate volume from flow rate and duration
+            volume = flow * (duration/60)
+        
+        if not self.calibrate:
+            self.publish_volume(volume=volume)
+            self.print_flush(f'Flow ended at {this_last_pulse_time.ctime()} -> duration: {round(duration, 2)}s pulses: {this_count} Hz: {round(avg_frequency, 2)} Flow: {round(flow, 2)} gal/min Volume: {round(volume, 2)} gal')
+            self.writeCsv(start=this_start_time.timestamp(), end=this_last_pulse_time.timestamp(), duration=duration, pulses=this_count, flow=flow, volume=volume)
+        else:
+            self.print_flush(f'Calibration flow ended at {this_last_pulse_time.ctime()} -> duration: {round(duration, 2)}s pulses: {this_count} Hz: {round(avg_frequency, 2)} Flow: {round(flow, 2)} gal/min Volume: {self.CALIBRATE_VOLUME} gal Calibration Factor: {round(calibration_factor, 2)}')
+            avg_calibration_factor = sum(self.calibration_factor_values) / len(self.calibration_factor_values)
+            if self.calibrate_counter % self.CALIBRATE_ROUNDS == 0:
+                self.print_flush(f'Calibration round complete ({self.calibrate_counter}/{self.CALIBRATE_ROUNDS}) -> Calibration Factor: {avg_calibration_factor}')
+                self.print_flush(f'Continue to calibrate or provide new calibration factor and restart in normal mode')
+            else:
+                self.print_flush(f'Calibration round {self.calibrate_counter}/{self.CALIBRATE_ROUNDS} Calibration Factor: {avg_calibration_factor}')
+            self.writeCalibrationCsv(start=this_start_time.timestamp(), end=this_last_pulse_time.timestamp(), duration=duration, pulses=this_count, frequency=avg_frequency, volume=self.CALIBRATE_VOLUME, calibration_factor=calibration_factor)
     
-    def start(self):
+    def start(self, calibrate_volume:float=-1):
         # Called to start the monitoring of the flow meter
         # Generate the CSV file using current timestamp
-        self.csv_file = path.join(self.csv_path, f'flow_data_{datetime.now().timestamp()}.csv')
+        if calibrate_volume > 0:
+            self.calibrate = True
+            filename = f'flow_data_calibration_{calibrate_volume}gal_{datetime.now().timestamp()}.csv'
+            self.CALIBRATE_VOLUME = calibrate_volume
+            self.fieldnames = self.calibrate_fieldnames.copy()
+            self.print_flush(f'Calibrating flow meter with {calibrate_volume} gal')
+        else:
+            filename = f'flow_data_{datetime.now().timestamp()}.csv'
+        self.csv_file = path.join(self.csv_path, filename)
         with open(self.csv_file, 'w', newline='') as csvfile:
             writer = DictWriter(csvfile, fieldnames=self.fieldnames)
             writer.writeheader()
@@ -116,15 +159,20 @@ class FlowMeter:
         # Ensure values are properly set for startup
         self.reset()
         
-        # Connect to MQTT Broker and start background MQTT loop
-        self.mqtt_client.connect(host=self.MQTT_SERVER)
-        self.mqtt_client.loop_start()
-        self.print_flush(f'Connected to MQTT server: {self.MQTT_SERVER}')
+        if not self.calibrate:
+            # Connect to MQTT Broker and start background MQTT loop
+            self.mqtt_client.connect(host=self.MQTT_SERVER)
+            self.mqtt_client.loop_start()
+            self.print_flush(f'Connected to MQTT server: {self.MQTT_SERVER}')
         
         # Activate the sensor callback function
         self.sensor.when_activated = self.sensor_activated
         
-        self.print_flush('Flow meter started')
+        if self.calibrate:
+            self.print_flush('Flow meter started in calibration mode')
+            self.print_flush(f'Dispense {self.CALIBRATE_VOLUME} gal of water {self.CALIBRATE_ROUNDS} times pausing for at least {self.MIN_TIME_INACTIVE} seconds to determine calibration factor')
+        else:
+            self.print_flush('Flow meter started')
     
     def sensor_activated(self):
         # Function called when a pulse is detected by the flow meter
@@ -142,7 +190,9 @@ class FlowMeter:
                 self.flow_start_time = now_time
                 self.last_publish = now
                 self.is_flowing = True
-                self.print_flush(f'Flow started at {self.flow_start_time.ctime()} -> pulses: {self.current_count}')
+                if self.calibrate:
+                    self.calibrate_counter += 1
+                self.print_flush(f'Flow started at {self.flow_start_time.ctime()}')
                 
     
     def check_flow(self):
@@ -184,7 +234,7 @@ class FlowMeter:
                     self.publish_count = 0
             
             # Check and publish grabbed data without lock
-            if publish_duration >= self.ACTIVE_FLOW_PUBLISH_PERIOD:
+            if (not self.calibrate) and (publish_duration >= self.ACTIVE_FLOW_PUBLISH_PERIOD):
                 # publish current flow rate to MQTT
                 self.publish_flow(duration=publish_duration, count=this_publish_count)
                 
@@ -193,8 +243,8 @@ class FlowMeter:
                 self.flow_ended(this_start_time=this_start_time, this_flow_start=this_flow_start, this_last_pulse=this_last_pulse, this_last_pulse_time=this_last_pulse_time, this_count=this_count)
         
     def calculate_flow(self, duration, count) -> float:
-        # Calculate flow rate in L/min then convert to gal/min (divide by 3.78541)
-        return ((count / duration) / self.F_VALUE) / 3.78541
+        # Calculate flow rate in gal/min
+        return ((count / (duration / 60)) / self.CALIBRATION_FACTOR)
     
     def publish_flow(self, duration=0, count=0):
         # If count is 0 (or not provided) then skip calculation and publish 0
@@ -226,7 +276,7 @@ class FlowMeter:
         # Simple wraapper to print then flush stdout for systemd journal
         print(message)
         sys.stdout.flush()
-    
+        
     def test(self):
         # Debugging function to test sensor activation/deactivation
         self.sensor.when_activated = self.print_activate
@@ -234,7 +284,8 @@ class FlowMeter:
 
 if __name__ == '__main__':
     flow_meter = FlowMeter()
-    flow_meter.start()
+    #flow_meter.start()
+    flow_meter.start(calibrate_volume=(1 / 8))
     #flow_meter.test()
     
     # Loop forever checking flow and publishing when needed
